@@ -4,6 +4,22 @@
 
 #include "utils.cuh"
 
+#include "cutlass/arch/reg_reconfig.h"
+
+// On sm_12x ptxas drops setmaxnreg with a performance warning, because the
+// bulk copies become extern calls. K2's ~98 KB of smem only fits one block
+// per SM there anyway, so launch one block and skip the reallocation.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+#define FLASHKDA_K2_REG_REALLOC 0
+#else
+#define FLASHKDA_K2_REG_REALLOC 1
+#endif
+
+template <int NumThreads>
+constexpr int k2_min_blocks_per_sm() {
+    return (NumThreads == 256 && !FLASHKDA_K2_REG_REALLOC) ? 1 : 2;
+}
+
 template <int D, int CHUNK = 16, int VD = D>
 struct K2Layouts {
     using MMALayout = decltype(tile_to_shape(
@@ -159,7 +175,8 @@ template <
     typename SeqlenT = int64_t,
     int VD = D
 >
-__global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
+__global__ void __launch_bounds__(NumThreads, k2_min_blocks_per_sm<NumThreads>())
+_flash_kda_fwd_recurrence(
     CUTE_GRID_CONSTANT TmaLoadV const tma_load_v,
     CUTE_GRID_CONSTANT TmaLoadBeta const tma_load_beta,
     CUTE_GRID_CONSTANT TmaLoadState const tma_load_initial_state,
@@ -208,6 +225,21 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
     constexpr int kWarpSize = 32;
     constexpr int kComputeThreads = 128;
     constexpr int kVSlices = D / VD;
+    // The full-width fp32 state needs more than 168 registers, so that path
+    // runs 256 threads and warpgroup 1 (load/store) hands registers to
+    // warpgroup 0 (math) via setmaxnreg. The V-split path keeps 192.
+    constexpr bool kFullWidthThreads = NumThreads == 2 * kComputeThreads;
+    constexpr bool kRegRealloc = kFullWidthThreads && FLASHKDA_K2_REG_REALLOC;
+    static_assert(kFullWidthThreads || NumThreads == kComputeThreads + 2 * kWarpSize,
+                  "K2 runs one math warpgroup plus load/store warps");
+    constexpr uint32_t kProducerRegs = 40;
+    constexpr uint32_t kMathRegs = 216;
+    static_assert(kComputeThreads * (kProducerRegs + kMathRegs) <=
+                      2 * kComputeThreads * 128,
+                  "reallocation must fit the launch register budget");
+#if defined(__CUDA_ARCH__) && FLASHKDA_K2_REG_REALLOC && !defined(CUDA_CTA_RECONFIG_ACTIVATED)
+#error "K2 needs setmaxnreg: without it the fp32 state spills"
+#endif
 
     // Transaction bytes: v + beta + k_decayed + q_decayed + k_restored + g_total + INV + Mqk
     constexpr uint32_t kTmaTransactionBytes =
@@ -359,6 +391,14 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
         __syncthreads();
     }
 
+    // Every warp of a warpgroup must run setmaxnreg, idle warps included.
+    // The idle warps stay alive for the fp32 final-state conversion below.
+    if constexpr (kRegRealloc) {
+        if (warp_id >= kComputeThreads / kWarpSize) {
+            cutlass::arch::warpgroup_reg_dealloc<kProducerRegs>();
+        }
+    }
+
     // --- LOAD warp: issue TMA loads for v, beta, and workspace intermediates
     if (warp_role == WarpRole::LOAD_QKG && lane_predicate) {
         Tensor g_v = tma_load_v.get_tma_tensor(make_shape(H, T_total, D));
@@ -432,6 +472,10 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
 
     // --- MMA warps
     if (warp_role == WarpRole::MMA) {
+        // Inside the branch so that ptxas allocates the math loop against kMathRegs.
+        if constexpr (kRegRealloc) {
+            cutlass::arch::warpgroup_reg_alloc<kMathRegs>();
+        }
         LoadPipelineState load_read;
         StorePipelineState out_write = cutlass::make_producer_start_state<StorePipeline>();
         int compute_tid = threadIdx.x;
