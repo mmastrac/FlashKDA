@@ -205,7 +205,11 @@ void fwd(
         attr_status == cudaSuccess,
         "failed to query CUDA multiprocessor count: ",
         cudaGetErrorString(attr_status));
-    bool use_vsplit = 2 * H * N_val <= num_sms;
+    // The fp32 resident state doubles the per-warp fragment budget. V-split
+    // keeps one value block per warp, so the state costs what the bf16
+    // full-width path used to.
+    bool use_vsplit = true;
+    (void)num_sms;
 
     // Validate state shapes: always [N, H, D, D]
     if (has_state_in) {
