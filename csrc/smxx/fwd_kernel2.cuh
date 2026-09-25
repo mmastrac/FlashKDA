@@ -324,6 +324,9 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
     using ResidentStateAcc = decltype(resident_thr_mma.make_fragment_C(resident_c_ref));
     constexpr int kResidentStateRowBlocks = D / 16;
     ResidentStateAcc resident_state[kValueBlocksPerWarp][kResidentStateRowBlocks];
+    // bf16 shadow of the state, refreshed once per tile in Phase 6, so Phase 1
+    // feeds the MMA without converting on its critical path.
+    ResidentStateFragment resident_bf16[kValueBlocksPerWarp][kResidentStateRowBlocks];
     // For block (m, vb) of the transposed [K, V] view, the (k, v) coordinate
     // of each element in this thread's fragment. The fp32 tile is indexed
     // (v, k), so callers swap the pair.
@@ -407,6 +410,7 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
                     for (int i = 0; i < int(size(coords)); ++i) {
                         resident_state[bi][m](i) = s_fp32(get<1>(coords(i)), get<0>(coords(i)));
                     }
+                    cute::transform(resident_state[bi][m], resident_bf16[bi][m], ToBF16{});
                 }
             }
         }
@@ -516,12 +520,11 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
                         resident_s_acc_T,
                         make_shape(Int<16>{}, Int<16>{}),
                         make_coord(m, resident_warp_id * kValueBlocksPerWarp + bi));
-                    ResidentStateFragment state_bf16;
                     copy(
                         resident_load_c,
                         resident_thr_load_c.partition_S(state_block),
-                        resident_thr_load_c.retile_D(state_bf16));
-                    cute::transform(state_bf16, resident_state[bi][m], ToF32{});
+                        resident_thr_load_c.retile_D(resident_bf16[bi][m]));
+                    cute::transform(resident_bf16[bi][m], resident_state[bi][m], ToF32{});
                 }
             }
         }
@@ -625,14 +628,12 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
             for (int k = 0; k < K_BLOCKS; ++k) {
                 cute::transform(tCrAi_k, tCrA_k, cute::identity{});
                 cute::transform(tCrAi_q, tCrA_q, cute::identity{});
-                movm_transpose_c_to_b_16x16(
-                    narrow_state<ResidentStateFragment>(resident_state[0][k]), tCrB);
+                movm_transpose_c_to_b_16x16(resident_bf16[0][k], tCrB);
                 gemm(thr_mma, tCrA_k(_,_,Int<0>{}), tCrB(_,_,Int<0>{}), u_acc[0]);
                 gemm(thr_mma, tCrA_q(_,_,Int<0>{}), tCrB(_,_,Int<0>{}), out_acc[0]);
 
                 if constexpr (kValueBlocksPerWarp == 2) {
-                    movm_transpose_c_to_b_16x16(
-                        narrow_state<ResidentStateFragment>(resident_state[1][k]), tCrB);
+                    movm_transpose_c_to_b_16x16(resident_bf16[1][k], tCrB);
                 }
 
                 if (k + 1 < K_BLOCKS) {
@@ -788,6 +789,8 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
                             auto c1 = make_coord(make_coord(a, 1), 0, d);
                             state_fragment(c0) = fmaf(state_fragment(c0), g0, u_acc[bi](c0));
                             state_fragment(c1) = fmaf(state_fragment(c1), g1, u_acc[bi](c1));
+                            resident_bf16[bi][m](c0) = BF16(state_fragment(c0));
+                            resident_bf16[bi][m](c1) = BF16(state_fragment(c1));
                         }
                     }
 
@@ -799,8 +802,7 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
                                 s_acc_T,
                                 make_shape(Int<16>{}, Int<16>{}),
                                 make_coord(m, warp_id * kValueBlocksPerWarp + bi));
-                            auto state_bf16 = narrow_state<ResidentStateFragment>(state_fragment);
-                            copy(smem_tiled_store_C_T, smem_thr_store_C_T.retile_S(state_bf16), smem_thr_store_C_T.partition_D(s_block));
+                            copy(smem_tiled_store_C_T, smem_thr_store_C_T.retile_S(resident_bf16[bi][m]), smem_thr_store_C_T.partition_D(s_block));
                         }
                     } else if (export_checkpoint) {
                         Tensor s_block = local_tile(
@@ -809,8 +811,7 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
                             make_coord(
                                 m,
                                 warp_id * kValueBlocksPerWarp + bi));
-                        auto state_bf16 = narrow_state<ResidentStateFragment>(state_fragment);
-                        copy(smem_tiled_store_C_T, smem_thr_store_C_T.retile_S(state_bf16), smem_thr_store_C_T.partition_D(s_block));
+                        copy(smem_tiled_store_C_T, smem_thr_store_C_T.retile_S(resident_bf16[bi][m]), smem_thr_store_C_T.partition_D(s_block));
                     }
                 }
             }
