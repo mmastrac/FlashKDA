@@ -159,7 +159,7 @@ template <
     typename SeqlenT = int64_t,
     int VD = D
 >
-__global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
+__global__ void __launch_bounds__(NumThreads, 1) _flash_kda_fwd_recurrence(
     CUTE_GRID_CONSTANT TmaLoadV const tma_load_v,
     CUTE_GRID_CONSTANT TmaLoadBeta const tma_load_beta,
     CUTE_GRID_CONSTANT TmaLoadState const tma_load_initial_state,
