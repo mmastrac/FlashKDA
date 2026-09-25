@@ -14,8 +14,11 @@ Inside the container (it needs `nvcc` and the container's own torch):
     cp vllm_shim/flash_kda_vllm_shim.py vllm_shim/flash_kda_vllm_shim.pth "$SITE"/
 
 Then start vLLM with `FLASH_KDA_SHIM=1` in the environment on every rank. The
-engine log prints `[flash_kda shim] GLM KDA prefill routed through the flash_kda
-wheel` once per process when it takes effect.
+engine log prints `[flash_kda shim] installed` once per process at import, and
+`[flash_kda shim] first prefill call: the wheel's kernel is running` the first
+time a prefill goes through it. Only the second line proves the wheel ran: if
+`kda_prefill_backend` resolved to `triton`, the first line still appears and
+the second never does.
 
 To check the kernel alone before serving:
 

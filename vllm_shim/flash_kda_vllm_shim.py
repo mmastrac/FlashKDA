@@ -22,7 +22,12 @@ if os.environ.get("FLASH_KDA_SHIM", "0") == "1":
             return
         wm = mod.current_workspace_manager
 
+        called = {"n": 0}
+
         def _flashkda_prefill(self, q, k, v, g, beta, initial_state, cu_seqlens, out):
+            if called["n"] == 0:
+                print("[flash_kda shim] first prefill call: the wheel's kernel is running", file=sys.stderr)
+            called["n"] += 1
             assert self._flashkda_buffer_specs is not None
             final_state, workspace, workspace_out = wm().get_simultaneous(*self._flashkda_buffer_specs)
             final_state = final_state[: initial_state.shape[0]]
@@ -37,7 +42,7 @@ if os.environ.get("FLASH_KDA_SHIM", "0") == "1":
 
         cls._flashkda_prefill = _flashkda_prefill
         cls._kfix_patched = True
-        print("[flash_kda shim] GLM KDA prefill routed through the flash_kda wheel", file=sys.stderr)
+        print("[flash_kda shim] installed; a second line follows on the first prefill call", file=sys.stderr)
 
     class _Finder(importlib.abc.MetaPathFinder):
         _busy = False
