@@ -428,6 +428,8 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
                 Tensor s_kr = local_tile(tile_kr, thr2_2d, make_coord(0, t));
                 Tensor s_ki = local_tile(tile_ki, thr2_2d, make_coord(0, t));
 
+                // Each operand is formed from the fp32 normalized value and
+                // rounded to bf16 once. A product of two bf16 values rounds twice.
                 Tensor r_qd = make_tensor_like<BF16>(s_qd);
                 Tensor r_kd = make_tensor_like<BF16>(s_kd);
                 float q_inv = shared_storage.q_norm_inv.begin()[row];
@@ -435,11 +437,11 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
                 #pragma unroll
                 for (int v = 0; v < 2; ++v) {
                     float g = reg_g[pass][tile_idx][v];
-                    BF16 q = BF16(bf16_to_f32(reg_q[pass][tile_idx][v]) * q_inv);
-                    BF16 k = row < actual_len ? BF16(bf16_to_f32(reg_k[pass][tile_idx][v]) * k_inv_scale) : BF16(0);
-                    BF16 exp_cumsum = BF16(ex2_approx_ftz_f32(g));
-                    r_qd(0, v) = q * exp_cumsum * BF16(scale);
-                    r_kd(0, v) = k * exp_cumsum;
+                    float q = bf16_to_f32(reg_q[pass][tile_idx][v]) * q_inv;
+                    float k = row < actual_len ? bf16_to_f32(reg_k[pass][tile_idx][v]) * k_inv_scale : 0.f;
+                    float exp_cumsum = ex2_approx_ftz_f32(g);
+                    r_qd(0, v) = BF16(q * exp_cumsum * scale);
+                    r_kd(0, v) = BF16(k * exp_cumsum);
                 }
                 cute::copy(AutoVectorizingCopy{}, r_qd, s_qd);
                 cute::copy(AutoVectorizingCopy{}, r_kd, s_kd);
@@ -449,10 +451,10 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
                 #pragma unroll
                 for (int v = 0; v < 2; ++v) {
                     float g = reg_g[pass][tile_idx][v];
-                    BF16 k = row < actual_len ? BF16(bf16_to_f32(reg_k[pass][tile_idx][v]) * k_inv_scale) : BF16(0);
-                    BF16 inv_cumsum = BF16(ex2_approx_ftz_f32(-g));
-                    r_ki(0, v) = k * inv_cumsum;
-                    r_kr(0, v) = k * inv_cumsum * BF16(reg_gt[pass][tile_idx][v]);
+                    float k = row < actual_len ? bf16_to_f32(reg_k[pass][tile_idx][v]) * k_inv_scale : 0.f;
+                    float inv_cumsum = ex2_approx_ftz_f32(-g);
+                    r_ki(0, v) = BF16(k * inv_cumsum);
+                    r_kr(0, v) = BF16(k * inv_cumsum * reg_gt[pass][tile_idx][v]);
                 }
                 cute::copy(AutoVectorizingCopy{}, r_ki, s_ki);
                 cute::copy(AutoVectorizingCopy{}, r_kr, s_kr);

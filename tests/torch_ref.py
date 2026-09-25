@@ -153,10 +153,11 @@ def torch_ref(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial
     _, H, D = q.shape
     CHUNK = 16
     device = q.device
-    scale_bf16 = torch.tensor(scale, dtype=torch.bfloat16, device=device)
-
-    q = l2_normalize_kernel_match(q)
-    k = l2_normalize_kernel_match(k)
+    attn_scale = float(scale)
+    # q and k normalized in fp32. Kernel 1 forms each operand from these and
+    # rounds it to bf16 once.
+    q = l2_normalize_kernel_match(q.float())
+    k = l2_normalize_kernel_match(k.float())
 
     if A_log is not None:
         assert dt_bias is not None
@@ -178,9 +179,9 @@ def torch_ref(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial
     N = len(cu_seqlens) - 1
 
     if initial_state is not None:
-        # The kernel narrows an fp32 initial state to bf16 on load, then
-        # accumulates in fp32.
-        work_state = initial_state.to(torch.bfloat16).to(torch.float32)
+        # An fp32 state loads as it is and a bf16 state widens. The kernel
+        # accumulates in fp32 either way.
+        work_state = initial_state.to(torch.float32).clone()
     else:
         work_state = torch.zeros(N, H, D, D, dtype=torch.float32, device=device)
 
@@ -196,8 +197,8 @@ def torch_ref(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial
 
             for h in range(H):
                 g_chunk = torch.zeros(CHUNK, D, dtype=g.dtype, device=device)
-                q_chunk = torch.zeros(CHUNK, D, dtype=q.dtype, device=device)
-                k_chunk = torch.zeros(CHUNK, D, dtype=k.dtype, device=device)
+                q_chunk = torch.zeros(CHUNK, D, dtype=torch.float32, device=device)
+                k_chunk = torch.zeros(CHUNK, D, dtype=torch.float32, device=device)
                 v_chunk = torch.zeros(CHUNK, D, dtype=v.dtype, device=device)
                 beta_chunk = torch.zeros(CHUNK, dtype=beta.dtype, device=device)
 
@@ -209,18 +210,19 @@ def torch_ref(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial
 
                 g_cumsum = g_chunk.cumsum(dim=0)
                 g_total = g_cumsum[-1:]
-                k_decayed = k_chunk * fp32_ex2_ftz(g_cumsum).to(torch.bfloat16)
-                q_decayed = q_chunk * fp32_ex2_ftz(g_cumsum).to(torch.bfloat16) * scale_bf16
-                neg_g_cumsum_bf16 = fp32_ex2_ftz(-g_cumsum).to(torch.bfloat16)
-                k_inv = k_chunk * neg_g_cumsum_bf16
-                g_total_exp_bf16 = fp32_ex2_ftz(g_total).to(torch.bfloat16)
-                k_restored = k_inv * g_total_exp_bf16
+                # Each operand is formed in fp32 and rounded to bf16 once, in
+                # kernel 1's order of operations.
+                exp_cumsum = fp32_ex2_ftz(g_cumsum)
+                k_decayed = (k_chunk * exp_cumsum).to(torch.bfloat16)
+                q_decayed = ((q_chunk * exp_cumsum) * attn_scale).to(torch.bfloat16)
+                inv_cumsum = fp32_ex2_ftz(-g_cumsum)
+                k_inv = (k_chunk * inv_cumsum).to(torch.bfloat16)
+                k_restored = ((k_chunk * inv_cumsum) * fp32_ex2_ftz(g_total)).to(torch.bfloat16)
                 L = torch.mm(k_decayed, k_inv.t(), out_dtype=torch.float32)
                 Mqk = torch.matmul(q_decayed, k_inv.t())
 
                 # Fuse sigmoid via tanh.approx: beta is bf16 logits
                 beta_activated = sigmoid_ext.sigmoid_tanh_fp32(beta_chunk.to(torch.float32))
-                beta_val_bf16 = beta_activated.to(torch.bfloat16).unsqueeze(-1)
                 L = torch.tril(L, diagonal=-1) * beta_activated.unsqueeze(-1)
                 Mqk = torch.tril(Mqk)
 
@@ -228,12 +230,15 @@ def torch_ref(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial
 
                 state_slice = work_state[seq_idx, h]
                 state_bf16 = state_slice.to(torch.bfloat16)  # MMA operand
-                v_chunk = v_chunk - torch.matmul(k_decayed, state_bf16.t())
-                v_chunk = v_chunk * beta_val_bf16
+                # u is formed in fp32 and rounded once, as the bf16 operand of
+                # the INV matmul.
+                v_chunk = ((v_chunk.float() - torch.mm(k_decayed, state_bf16.t(), out_dtype=torch.float32))
+                           * beta_activated.unsqueeze(-1)).to(torch.bfloat16)
 
                 U = torch.matmul(INV, v_chunk)
-                _out = torch.matmul(q_decayed, state_bf16.t())
-                _out = _out + torch.matmul(Mqk, U)
+                # Both output matmuls accumulate in fp32, then one rounding.
+                _out = (torch.mm(q_decayed, state_bf16.t(), out_dtype=torch.float32)
+                        + torch.mm(Mqk, U, out_dtype=torch.float32)).to(torch.bfloat16)
 
                 delta_s = torch.mm(k_restored.t(), U, out_dtype=torch.float32)
 
@@ -244,9 +249,4 @@ def torch_ref(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial
                 out[t0:t0 + actual_len, h] = _out[:actual_len]
 
     if final_state is not None:
-        # The kernel stores the state through its bf16 shared-memory tile.
-        final_bf16 = work_state.to(torch.bfloat16)
-        if state_fp32:
-            final_state.copy_(final_bf16.to(torch.float32))
-        else:
-            final_state.copy_(final_bf16)
+        final_state.copy_(work_state.to(final_state.dtype))

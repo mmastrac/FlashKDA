@@ -283,6 +283,57 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
     int t_tiles  = (seq_len + CHUNK - 1) / CHUNK;
 
     // --- Load initial state
+    constexpr int kValueBlocksPerWarp =
+        VD / ((kComputeThreads / kWarpSize) * 16);
+    static_assert(
+        kValueBlocksPerWarp == 1 || kValueBlocksPerWarp == 2);
+
+    // Each MMA warp holds its share of the recurrent [K, V] state, a column
+    // of 16x16 blocks, in registers for the whole chunk loop. Phase 1
+    // transposes each block into a B operand with MOVM_T and Phase 6 updates
+    // it in place. Shared memory carries the state twice: into the registers
+    // at entry and, when a final state is wanted, out to the TMA store.
+    //
+    // These are declared here, outside the MMA warps' branch, because the
+    // MMA warps read an fp32 state out of the TMA load's buffer, and that
+    // read has to finish before the entry barrier. After the barrier the
+    // input pipeline reuses the same buffer for its stages.
+    Tensor resident_s_acc_T = make_tensor(
+        make_smem_ptr(shared_storage.state_acc.begin()),
+        TransposedStateSmemLayout{});
+    auto resident_mma = make_tiled_mma(
+        MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>{},
+        Layout<Shape<_1,_1>>{},
+        Tile<_16,_16,_16>{});
+    const int resident_warp_id = int(threadIdx.x) / kWarpSize;
+    const int resident_lane_id = int(threadIdx.x) % kWarpSize;
+    auto resident_thr_mma = resident_mma.get_slice(resident_lane_id);
+    auto resident_load_c = make_tiled_copy_C(
+        Copy_Atom<SM75_U16x8_LDSM_T, BF16>{}, resident_mma);
+    auto resident_thr_load_c = resident_load_c.get_slice(resident_lane_id);
+    Tensor resident_state_ref = local_tile(
+        resident_s_acc_T,
+        make_shape(Int<16>{}, Int<16>{}),
+        make_coord(0, resident_warp_id * kValueBlocksPerWarp));
+    auto resident_c_ref = resident_thr_mma.partition_C(resident_state_ref);
+    using ResidentStateFragment = decltype(make_fragment_like<BF16>(
+        resident_thr_mma.make_fragment_C(resident_c_ref)));
+    // The state accumulates in fp32. Rounding the state to bf16 after every
+    // 16-token tile adds a fresh 0.2% relative error each time, and a
+    // 16k-token chunk has a thousand tiles.
+    using ResidentStateAcc = decltype(resident_thr_mma.make_fragment_C(resident_c_ref));
+    constexpr int kResidentStateRowBlocks = D / 16;
+    ResidentStateAcc resident_state[kValueBlocksPerWarp][kResidentStateRowBlocks];
+    // For block (m, vb) of the transposed [K, V] view, the (k, v) coordinate
+    // of each element in this thread's fragment. The fp32 tile is indexed
+    // (v, k), so callers swap the pair.
+    auto resident_coords = [&](int m, int vb) {
+        return resident_thr_mma.partition_C(local_tile(
+            make_identity_tensor(make_shape(Int<D>{}, Int<VD>{})),
+            make_shape(Int<16>{}, Int<16>{}),
+            make_coord(m, vb)));
+    };
+
     if constexpr (HasStateIn && !StateFP32) {
         // BF16 state: TMA load directly into state_acc
         if (warp_role == WarpRole::LOAD_QKG) {
@@ -339,11 +390,26 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
         __syncthreads();
         cutlass::arch::fence_view_async_shared();
 
-        // All threads: convert fp32 -> bf16 with layout transformation
-        smem_cvt_fp32_to_bf16<FP32StateSmemLayout, StateSmemLayout, VD, D, NumThreads>(
-            reinterpret_cast<float*>(shared_storage.state_fp32_buf),
-            shared_storage.state_acc.begin(),
-            threadIdx.x);
+        // The MMA warps copy the fp32 state from the TMA buffer into their
+        // fragments. The input pipeline writes its stages into this same
+        // buffer, so the barrier after this block stops it until every warp
+        // has finished the copy.
+        if (warp_role == WarpRole::MMA) {
+            Tensor s_fp32 = make_tensor(
+                make_smem_ptr(reinterpret_cast<float*>(shared_storage.state_fp32_buf)),
+                FP32StateSmemLayout{});
+            #pragma unroll
+            for (int m = 0; m < kResidentStateRowBlocks; ++m) {
+                #pragma unroll
+                for (int bi = 0; bi < kValueBlocksPerWarp; ++bi) {
+                    auto coords = resident_coords(m, resident_warp_id * kValueBlocksPerWarp + bi);
+                    #pragma unroll
+                    for (int i = 0; i < int(size(coords)); ++i) {
+                        resident_state[bi][m](i) = s_fp32(get<1>(coords(i)), get<0>(coords(i)));
+                    }
+                }
+            }
+        }
         __syncthreads();
     } else {
         // No state in: zero-initialize state_acc
@@ -436,61 +502,27 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
         StorePipelineState out_write = cutlass::make_producer_start_state<StorePipeline>();
         int compute_tid = threadIdx.x;
 
-        constexpr int kValueBlocksPerWarp =
-            VD / ((kComputeThreads / kWarpSize) * 16);
-        static_assert(
-            kValueBlocksPerWarp == 1 || kValueBlocksPerWarp == 2);
-
-        // Keep this warp's value columns of the recurrent [K,V] state in
-        // BF16 C fragments for the entire chunk loop. Phase 1 transposes each
-        // fragment into an MMA-B operand with MOVM_T; Phase 6 updates the C
-        // fragment in place. Shared memory is touched only at entry and, when
-        // requested, once more before the final-state TMA store.
-        Tensor resident_s_acc_T = make_tensor(
-            make_smem_ptr(shared_storage.state_acc.begin()),
-            TransposedStateSmemLayout{});
-        auto resident_mma = make_tiled_mma(
-            MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>{},
-            Layout<Shape<_1,_1>>{},
-            Tile<_16,_16,_16>{});
-        const int resident_warp_id = compute_tid / kWarpSize;
-        const int resident_lane_id = compute_tid % kWarpSize;
-        auto resident_thr_mma = resident_mma.get_slice(resident_lane_id);
-        auto resident_load_c = make_tiled_copy_C(
-            Copy_Atom<SM75_U16x8_LDSM_T, BF16>{}, resident_mma);
-        auto resident_thr_load_c = resident_load_c.get_slice(resident_lane_id);
-        Tensor resident_state_ref = local_tile(
-            resident_s_acc_T,
-            make_shape(Int<16>{}, Int<16>{}),
-            make_coord(0, resident_warp_id * kValueBlocksPerWarp));
-        auto resident_c_ref = resident_thr_mma.partition_C(resident_state_ref);
-        using ResidentStateFragment = decltype(make_fragment_like<BF16>(
-            resident_thr_mma.make_fragment_C(resident_c_ref)));
-        // The state accumulates in fp32. Rounding the state to bf16 after every
-        // 16-token tile adds a fresh 0.2% relative error each time, and a
-        // 16k-token chunk has a thousand tiles.
-        using ResidentStateAcc = decltype(resident_thr_mma.make_fragment_C(resident_c_ref));
-        constexpr int kResidentStateRowBlocks = D / 16;
-        ResidentStateAcc resident_state[kValueBlocksPerWarp][kResidentStateRowBlocks];
         SeqlenT checkpoint_offset = 0;
         if constexpr (HasCheckpoint) {
             checkpoint_offset = checkpoint_offsets[seq_idx];
         }
 
-        #pragma unroll
-        for (int m = 0; m < kResidentStateRowBlocks; ++m) {
+        if constexpr (!(HasStateIn && StateFP32)) {
             #pragma unroll
-            for (int bi = 0; bi < kValueBlocksPerWarp; ++bi) {
-                Tensor state_block = local_tile(
-                    resident_s_acc_T,
-                    make_shape(Int<16>{}, Int<16>{}),
-                    make_coord(m, resident_warp_id * kValueBlocksPerWarp + bi));
-                ResidentStateFragment state_bf16;
-                copy(
-                    resident_load_c,
-                    resident_thr_load_c.partition_S(state_block),
-                    resident_thr_load_c.retile_D(state_bf16));
-                cute::transform(state_bf16, resident_state[bi][m], ToF32{});
+            for (int m = 0; m < kResidentStateRowBlocks; ++m) {
+                #pragma unroll
+                for (int bi = 0; bi < kValueBlocksPerWarp; ++bi) {
+                    Tensor state_block = local_tile(
+                        resident_s_acc_T,
+                        make_shape(Int<16>{}, Int<16>{}),
+                        make_coord(m, resident_warp_id * kValueBlocksPerWarp + bi));
+                    ResidentStateFragment state_bf16;
+                    copy(
+                        resident_load_c,
+                        resident_thr_load_c.partition_S(state_block),
+                        resident_thr_load_c.retile_D(state_bf16));
+                    cute::transform(state_bf16, resident_state[bi][m], ToF32{});
+                }
             }
         }
 
@@ -617,12 +649,7 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
             }
             }
 
-            // ======== Phase 2: Cast out (keep in regs), load v/INV/beta ========
-            SFragT out_bf16[kValueBlocksPerWarp];
-            #pragma unroll
-            for (int i = 0; i < kValueBlocksPerWarp; ++i)
-                cute::transform(out_acc[i], out_bf16[i], [] __device__ (float x) { return BF16(x); });
-
+            // ======== Phase 2: load v/INV/beta (out stays fp32 in out_acc) ========
             SFragT v_bf16[kValueBlocksPerWarp];
             #pragma unroll
             for (int i = 0; i < kValueBlocksPerWarp; ++i) {
@@ -633,8 +660,8 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
             copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(INV), tCrAi_k_view);
             cute::transform(tCrAi_k, tCrA_k, cute::identity{});
 
-            BF16 beta0 = BF16(sigmoid_tanh_approx_f32(float(beta_tile(beta_smem_offset + group_id))));
-            BF16 beta1 = BF16(sigmoid_tanh_approx_f32(float(beta_tile(beta_smem_offset + group_id + 8))));
+            float beta0 = sigmoid_tanh_approx_f32(float(beta_tile(beta_smem_offset + group_id)));
+            float beta1 = sigmoid_tanh_approx_f32(float(beta_tile(beta_smem_offset + group_id + 8)));
 
             // ======== Phase 3: u = (v - u) * beta; u = INV @ u (per block) ========
             SFragT u_bf16[kValueBlocksPerWarp];
@@ -642,16 +669,14 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
 
             #pragma unroll
             for (int i = 0; i < kValueBlocksPerWarp; ++i) {
-                cute::transform(u_acc[i], u_bf16[i], [] __device__ (float x) { return BF16(x); });
-
                 #pragma unroll
                 for (int a = 0; a < 2; ++a) {
                     #pragma unroll
                     for (int d = 0; d < 2; ++d) {
                         auto c0 = make_coord(make_coord(a, 0), 0, d);
                         auto c1 = make_coord(make_coord(a, 1), 0, d);
-                        u_bf16[i](c0) = (v_bf16[i](c0) - u_bf16[i](c0)) * beta0;
-                        u_bf16[i](c1) = (v_bf16[i](c1) - u_bf16[i](c1)) * beta1;
+                        u_bf16[i](c0) = BF16((bf16_to_f32(v_bf16[i](c0)) - u_acc[i](c0)) * beta0);
+                        u_bf16[i](c1) = BF16((bf16_to_f32(v_bf16[i](c1)) - u_acc[i](c1)) * beta1);
                     }
                 }
 
@@ -691,12 +716,7 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
                 b_dst[0] = u_b_regs[0]; b_dst[1] = u_b_regs[1];
                 b_dst[2] = u_b_regs[2]; b_dst[3] = u_b_regs[3];
 
-                clear(out_acc[i]);
                 gemm(thr_mma, tCrA_k(_,_,Int<0>{}), tCrB_u_arr[i](_,_,Int<0>{}), out_acc[i]);
-
-                SFragT gemm_bf16;
-                cute::transform(out_acc[i], gemm_bf16, [] __device__ (float x) { return BF16(x); });
-                cute::transform(out_bf16[i], gemm_bf16, out_bf16[i], [] __device__ (BF16 c, BF16 a) { return c + a; });
             }
 
             // Late output-acquire (cycle trim): first out-stage write is in
@@ -707,7 +727,8 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
             #pragma unroll
             for (int i = 0; i < kValueBlocksPerWarp; ++i) {
                 Tensor out_block = local_tile(out_tile, make_shape(Int<16>{}, Int<16>{}), make_coord(0, warp_id * kValueBlocksPerWarp + i));
-                copy(smem_tiled_store_C, smem_thr_store_C.retile_S(out_bf16[i]), smem_thr_store_C.partition_D(out_block));
+                auto out_bf16 = narrow_state<SFragT>(out_acc[i]);
+                copy(smem_tiled_store_C, smem_thr_store_C.retile_S(out_bf16), smem_thr_store_C.partition_D(out_block));
             }
 
             // ======== Phase 6: s_acc update ========
@@ -886,12 +907,24 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
 
         __syncthreads();  // all warps sync — pipeline smem now free
 
-        smem_cvt_bf16_to_fp32<StateSmemLayout, FP32StateSmemLayout, VD, D, NumThreads>(
-            shared_storage.state_acc.begin(),
-            reinterpret_cast<float*>(shared_storage.state_fp32_buf),
-            threadIdx.x);
+        if (warp_role == WarpRole::MMA) {
+            Tensor s_fp32 = make_tensor(
+                make_smem_ptr(reinterpret_cast<float*>(shared_storage.state_fp32_buf)),
+                FP32StateSmemLayout{});
+            #pragma unroll
+            for (int m = 0; m < kResidentStateRowBlocks; ++m) {
+                #pragma unroll
+                for (int bi = 0; bi < kValueBlocksPerWarp; ++bi) {
+                    auto coords = resident_coords(m, resident_warp_id * kValueBlocksPerWarp + bi);
+                    #pragma unroll
+                    for (int i = 0; i < int(size(coords)); ++i) {
+                        s_fp32(get<1>(coords(i)), get<0>(coords(i))) = resident_state[bi][m](i);
+                    }
+                }
+            }
+        }
         cutlass::arch::fence_view_async_shared();  // generic-proxy writes -> visible to async proxy (TMA)
-        __syncthreads();  // conversion complete
+        __syncthreads();  // the fp32 tile is complete
 
         if (warp_role == WarpRole::STORE && lane_predicate) {
             Tensor g_final = tma_store_final_state.get_tma_tensor(make_shape(N * H, D, D));
