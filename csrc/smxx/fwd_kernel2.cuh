@@ -15,6 +15,13 @@
 #define FLASHKDA_K2_REG_REALLOC 1
 #endif
 
+// sm_10x ptxas branches around the in-loop state spill, so spill after the loop.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ / 100 == 10
+#define FLASHKDA_K2_SPILL_AFTER_UPDATE 1
+#else
+#define FLASHKDA_K2_SPILL_AFTER_UPDATE 0
+#endif
+
 template <int NumThreads>
 constexpr int k2_min_blocks_per_sm() {
     return (NumThreads == 256 && !FLASHKDA_K2_REG_REALLOC) ? 1 : 2;
@@ -232,8 +239,9 @@ _flash_kda_fwd_recurrence(
     constexpr bool kRegRealloc = kFullWidthThreads && FLASHKDA_K2_REG_REALLOC;
     static_assert(kFullWidthThreads || NumThreads == kComputeThreads + 2 * kWarpSize,
                   "K2 runs one math warpgroup plus load/store warps");
-    constexpr uint32_t kProducerRegs = 40;
-    constexpr uint32_t kMathRegs = 216;
+    constexpr bool kSpillAfterUpdate = FLASHKDA_K2_SPILL_AFTER_UPDATE;
+    constexpr uint32_t kProducerRegs = kSpillAfterUpdate ? 32 : 40;
+    constexpr uint32_t kMathRegs = kSpillAfterUpdate ? 224 : 216;
     static_assert(kComputeThreads * (kProducerRegs + kMathRegs) <=
                       2 * kComputeThreads * 128,
                   "reallocation must fit the launch register budget");
@@ -816,7 +824,7 @@ _flash_kda_fwd_recurrence(
 
                     // The store warp observes the last output-stage commit only
                     // after these writes and the following shared-memory fence.
-                    if constexpr (HasStateOut) {
+                    if constexpr (HasStateOut && !kSpillAfterUpdate) {
                         if (t + 1 == t_tiles || export_checkpoint) {
                             Tensor s_block = local_tile(
                                 s_acc_T,
@@ -825,7 +833,7 @@ _flash_kda_fwd_recurrence(
                             auto state_bf16 = narrow_state<ResidentStateFragment>(state_fragment);
                             copy(smem_tiled_store_C_T, smem_thr_store_C_T.retile_S(state_bf16), smem_thr_store_C_T.partition_D(s_block));
                         }
-                    } else if (export_checkpoint) {
+                    } else if (export_checkpoint && !kSpillAfterUpdate) {
                         Tensor s_block = local_tile(
                             s_acc_T,
                             make_shape(Int<16>{}, Int<16>{}),
@@ -833,6 +841,20 @@ _flash_kda_fwd_recurrence(
                                 m,
                                 warp_id * kValueBlocksPerWarp + bi));
                         auto state_bf16 = narrow_state<ResidentStateFragment>(state_fragment);
+                        copy(smem_tiled_store_C_T, smem_thr_store_C_T.retile_S(state_bf16), smem_thr_store_C_T.partition_D(s_block));
+                    }
+                }
+            }
+            if (kSpillAfterUpdate && ((HasStateOut && t + 1 == t_tiles) || export_checkpoint)) {
+                #pragma unroll
+                for (int m = 0; m < S_M_BLOCKS; ++m) {
+                    #pragma unroll
+                    for (int bi = 0; bi < kValueBlocksPerWarp; ++bi) {
+                        Tensor s_block = local_tile(
+                            s_acc_T,
+                            make_shape(Int<16>{}, Int<16>{}),
+                            make_coord(m, warp_id * kValueBlocksPerWarp + bi));
+                        auto state_bf16 = narrow_state<ResidentStateFragment>(resident_state[bi][m]);
                         copy(smem_tiled_store_C_T, smem_thr_store_C_T.retile_S(state_bf16), smem_thr_store_C_T.partition_D(s_block));
                     }
                 }
@@ -920,6 +942,7 @@ _flash_kda_fwd_recurrence(
                 cta_tma_store_state.partition_D(g_final_tile)
             );
             tma_store_arrive();
+            tma_store_wait<0>();
         }
     }
 
@@ -953,6 +976,7 @@ _flash_kda_fwd_recurrence(
                 cta_tma_store_state.partition_D(g_final_tile)
             );
             tma_store_arrive();
+            tma_store_wait<0>();
         }
     }
 
